@@ -18,7 +18,7 @@ from infx.golden_al_distribution import (
 )
 from infx.golden_al_distribution.__main__ import main
 
-SOURCE_RUN = r"https://github\.com/SemiAnalysisAI/InferenceX/actions/runs/\d+"
+SOURCE_RUN = r"https://github\.com/SemiAnalysisAI/InferenceX(-local)?/actions/runs/\d+"
 
 
 def test_every_committed_curve_is_valid() -> None:

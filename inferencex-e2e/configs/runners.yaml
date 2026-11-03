@@ -1,4 +1,6 @@
 labels:
+  cluster:gb10-spark:
+    - gb10-spark_00
   h100:
     - h100-cw_00
     - h100-cw_01
@@ -329,6 +331,49 @@ labels:
     - mi355x-amds_08
     - mi355x-amds_09
 clusters:
+  gb10-spark:
+    gpus-per-node: 1
+    arch: aarch64
+    env:
+      # FlashInfer's JIT compiles take host memory, which GB10 shares with the GPU.
+      MAX_JOBS: "10"
+      # Otherwise the root filesystem is read-only, and SGLang's offload, TMPDIR and a
+      # SPEED-Bench collector's pip install write to it.
+      ENROOT_ROOTFS_WRITABLE: "1"
+      # The container's /tmp is a tmpfs in unified memory.
+      TMPDIR: /var/tmp
+    models:
+      download-root: models
+    scheduler: slurm
+    slurm:
+      partition: gb10
+      exclusive: true
+      gres: "gpu:{gpus}"
+      volumes:
+        hf-home: {path: ~/.cache/huggingface}
+        hf-hub-cache: {path: ~/.cache/huggingface/hub}
+        aiperf-cache: {path: ~/.cache/inferencex/aiperf-cache}
+        models: {path: ~/.cache/inferencex/models}
+      squash:
+        dir: ~/.cache/inferencex/squash
+        visibility: shared
+        import: submit-host
+        lock-timeout-s: 3600
+        single-node-import: true
+      srt-slurm:
+        extra:
+          # The launcher's single-node path requires a GPU exporter. Not the distroless image,
+          # as default_reuse_container below prepares each image by running `true` in it.
+          default_gpu_exporter:
+            container_image: nvcr.io#nvidia/k8s/dcgm-exporter:4.5.2-4.8.1-ubuntu22.04
+            port: 9401
+            command: "dcgm-exporter --collect-interval=1000 --address :{port} -f /configs/dcgm-counters-noprof.csv"
+          # Steps share one unpacked root filesystem per image.
+          default_reuse_container: true
+        network-interface: ""
+        volume-mounts:
+          aiperf-cache: /aiperf_mmap_cache
+          hf-hub-cache: /hf_hub_cache
   h100-cw:
     gpus-per-node: 8
     available-cpu-dram-mib: 1_998_848

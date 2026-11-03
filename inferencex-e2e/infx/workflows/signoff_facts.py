@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from infx import github
+from infx.config import MASTER_CONFIGS
 from infx.golden_al_distribution import curves
 from infx.klaud import api
 
@@ -375,9 +376,7 @@ def matrix_at(rev: str, workdir: Path) -> tuple[dict, dict[str, str]]:
     from infx.matrix.validation import load_config_files, load_runner_file
 
     project = _extract(rev, workdir)
-    configs = [
-        str(project / "configs" / name) for name in ("amd-master.yaml", "nvidia-master.yaml")
-    ]
+    configs = [str(project / path) for path in MASTER_CONFIGS]
     master = load_config_files([path for path in configs if Path(path).is_file()], validate=False)
     runners = load_runner_file(str(project / "configs" / "runners.yaml"), validate=False)
     matrix, errors = {}, {}

@@ -4,7 +4,26 @@ import os
 import subprocess
 from pathlib import Path
 
-MASTER_CONFIGS = ["configs/amd-master.yaml", "configs/nvidia-master.yaml"]
+LOCAL_MASTER_CONFIG = "configs/local-master.yaml"
+
+
+class _MasterConfigs(list[str]):
+    def present(self, directory: Path | None = None) -> list[str]:
+        """Return these paths, without the local master config where its file is missing.
+
+        Upstream's projects and revisions, and the projects its tests build, have no local master
+        config. With ``directory``, the files are looked up by name there and returned under it.
+        """
+        paths = [directory / Path(path).name if directory else Path(path) for path in self]
+        local = Path(LOCAL_MASTER_CONFIG).name
+        return [str(path) for path in paths if path.name != local or path.is_file()]
+
+
+MASTER_CONFIGS = _MasterConfigs([
+    "configs/amd-master.yaml",
+    "configs/nvidia-master.yaml",
+    LOCAL_MASTER_CONFIG,
+])  # fmt: skip
 RUNNER_CONFIG = "configs/runners.yaml"
 
 

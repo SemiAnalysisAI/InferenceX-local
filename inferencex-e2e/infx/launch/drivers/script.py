@@ -86,7 +86,8 @@ def run(launch: Launch) -> int:
     container = Container(
         image=image,
         command=("bash", request.bench_script_override),
-        gpus=request.gpu_count,
+        # speedbench-al.yml asks for a B300's 8 GPUs; a node with fewer gives the ones it has.
+        gpus=min(request.gpu_count, cluster.gpus_per_node),
         time_limit_min=time_limit,
         workspace=request.workspace,
         workdir=workdir,

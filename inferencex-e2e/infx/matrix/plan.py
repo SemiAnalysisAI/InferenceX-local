@@ -350,7 +350,7 @@ def build_plan(
         benchmark_scenarios_seen = defaultdict(set)
         eval_scenarios_seen = defaultdict(set)
 
-        config_files = MASTER_CONFIGS if config_files is None else config_files
+        config_files = MASTER_CONFIGS.present() if config_files is None else config_files
         master_config = load_config_files(config_files)
         root = config_root(config_files)
         runner_data = None
