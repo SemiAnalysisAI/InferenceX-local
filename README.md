@@ -1,3 +1,8 @@
+##  InferenceX-local, Local Open Source Inference Research Platform / 开源推理研究平台
+
+results here will still show up on https://inferencex.com
+
+# OG README
 #  InferenceX™, Open Source Inference Research Platform / 开源推理研究平台
 <p align="center">
   <a href="https://github.com/SemiAnalysisAI/InferenceX/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
