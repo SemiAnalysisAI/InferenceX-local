@@ -1,4 +1,4 @@
-##  InferenceX-local, Local Open Source Inference Research Platform / 开源推理研究平台
+#  InferenceX-local, Local Open Source Inference Research Platform / 开源推理研究平台
 
 results here will still show up on https://inferencex.com
 
