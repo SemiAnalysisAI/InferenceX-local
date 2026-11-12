@@ -207,6 +207,16 @@ def test_collector_writes_the_reference_yaml_into_the_workspace(fakes, workspace
     assert cancel == ["scancel", "42"]
 
 
+def test_a_node_with_fewer_gpus_than_requested_gives_the_gpus_it_has(fakes, workspace, tmp_path):
+    inventory = inventory_for(tmp_path)
+    inventory["clusters"]["fixture"]["gpus-per-node"] = 1
+
+    assert launch(load_inventory(inventory).clusters["fixture"], request_for(workspace)) == 0
+
+    [allocation] = [call for call in fakes() if call[0] == "salloc"]
+    assert "--gres=gpu:1" in allocation
+
+
 def test_collector_failure_propagates_and_still_cancels_the_allocation(
     fakes, workspace, tmp_path, monkeypatch
 ):

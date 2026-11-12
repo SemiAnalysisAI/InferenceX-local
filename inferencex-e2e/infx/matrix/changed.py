@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
         description="List config keys whose benchmark points or recipes differ from a base."
     )
     parser.add_argument("--base", required=True, help="Git ref to compare with, e.g. origin/main")
-    parser.add_argument("--config-files", nargs="+", default=MASTER_CONFIGS)
+    parser.add_argument("--config-files", nargs="+", default=MASTER_CONFIGS.present())
     parser.add_argument("--runner-config", default=RUNNER_CONFIG)
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     args = parser.parse_args(argv)

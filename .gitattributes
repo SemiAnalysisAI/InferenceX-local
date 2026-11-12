@@ -1,0 +1,3 @@
+# A merge of upstream main keeps this repository's copy. Needs: git config merge.ours.driver true
+inferencex-e2e/perf-changelog.yaml merge=ours
+.github/CODEOWNERS merge=ours

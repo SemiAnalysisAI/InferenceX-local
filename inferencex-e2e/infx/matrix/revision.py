@@ -91,8 +91,11 @@ class Revision:
 
     @property
     def master_configs(self) -> list[str]:
-        """Paths of the revision's master config files."""
-        return [str(self._configs / Path(path).name) for path in MASTER_CONFIGS]
+        """Paths of the revision's master config files.
+
+        A revision from before the local master config has none, so it is left out.
+        """
+        return MASTER_CONFIGS.present(self._configs)
 
     @property
     def runner_config(self) -> str:
