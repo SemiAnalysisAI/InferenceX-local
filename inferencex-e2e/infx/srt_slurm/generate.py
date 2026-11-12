@@ -7,7 +7,6 @@ import json
 import re
 import sys
 from collections.abc import Callable, Mapping
-from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,11 +14,12 @@ import yaml
 
 from infx.clusters import load_inventory
 from infx.clusters.slurm import slurm_settings
+from infx.fastcopy import deepcopy
 from infx.launch.context import LaunchError
 from infx.launch.drivers.srt import config, lanes, power
 from infx.launch.policy import launch_path
 from infx.launch.request import MultiNodeRequest
-from infx.matrix.generate import expand_config_keys, generate_config_matrix
+from infx.matrix.generate import SCENARIO_TYPES, expand_config_keys, generate_config_matrix
 from infx.matrix.validation import config_root, load_config_files, load_runner_file
 from infx.srt_slurm.single_node import select_recipe
 from infx.srt_slurm.synthetic_acceptance import build_overrides, selected_recipes
@@ -301,7 +301,9 @@ def generate_recipes(
         if not _runs_srt_slurm(inventory, master[key]["runner"]):
             print(f"Skipping {key}: the launcher's serve path runs its points", file=sys.stderr)
             continue
-        points = generate_config_matrix([key], master, runners, eval_mode="none", root=root)
+        points = generate_config_matrix(
+            [key], master, runners, scenario_types=SCENARIO_TYPES, eval_mode="none", root=root
+        )
         points = [point for point in points if point.get("srt-recipe")]
         if not points:
             raise ValueError(f"{key} has no srt-slurm points")
