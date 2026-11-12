@@ -821,6 +821,10 @@ RAPL_W = 250.0
 GRACE_SENSOR = "CPU{s}:cpuSidePowerUsageW"
 DCGM_SENSOR = "CPU{s}:cpuPowerUsageW"
 RAPL_SENSOR = "CPU{s}:packagePowerUsageW"
+SPARK_SENSOR = "CPU{s}:coresPowerUsageW"
+# A DGX Spark's one socket: its core clusters, and its SoC package as the module rail.
+SPARK_CORES_W = 40.0
+SPARK_PACKAGE_W = 120.0
 
 
 def _cpu_row(ts, host, socket, kind, watts):
@@ -828,6 +832,8 @@ def _cpu_row(ts, host, socket, kind, watts):
         return [2, repr(ts), host, "dcgm", DCGM_SENSOR.format(s=socket), socket, repr(watts), "", "", "", ""]
     if kind == "rapl":
         return [2, repr(ts), host, "rapl", RAPL_SENSOR.format(s=socket), socket, repr(watts), "", "", "", ""]
+    if kind == "spbm":
+        return [2, repr(ts), host, "spbm", SPARK_SENSOR.format(s=socket), socket, repr(watts), "", "", "", ""]
     rails = [repr(w) for w in RAILS_W.values()]
     return [2, repr(ts), host, "acpi", GRACE_SENSOR.format(s=socket), socket, repr(watts), *rails, "", ""]
 
@@ -942,6 +948,27 @@ class TestCpuSidePower:
         }
         summary = audit_summary(pkg.sidecar(), "power_validation.json")["power_audit"]["cpu"]
         assert (summary["sensor_kind"], summary["source"]) == ("rapl_package", "rapl")
+
+    def test_one_socket_spark_emits_cpu_keys_with_its_package_as_the_module_rail(self, tmp_path):
+        pkg = build_package(tmp_path)
+        rows = _cpu_rows({host: {"spbm": SPARK_CORES_W} for host in CPU_HOSTS})
+        socket_0 = [row for row in rows if row[5] == 0]
+        add_cpu_package(pkg, _v3(socket_0, SPARK_PACKAGE_W), CPU_HEADER_V3)
+        assert pkg.run(require_power=True, expected_cpu=True) == 0
+
+        agg = pkg.agg()
+        assert agg["cpu_power_valid"] == 1
+        assert {key: agg[key] for key in apm.CPU_METRIC_KEYS if key in agg} == {
+            "avg_cpu_socket_power_w": 40.0,
+            "avg_total_cpu_power_w": 80.0,
+            "total_cpu_energy_j": 4800.0,
+            "avg_total_module_power_w": 240.0,
+            "total_module_energy_j": 14400.0,
+        }
+        assert _gpu_fields(agg) == _reference_agg(tmp_path)
+        cpu = pkg.sidecar()["cpu"]
+        assert (cpu["sensor_kind"], cpu["source"]) == ("spark_cores", "spbm")
+        assert (cpu["sockets_per_host"], cpu["expected_sockets"], cpu["observed_sockets"]) == (1, 2, 2)
 
     def test_rail_gap_drops_only_that_rail(self, tmp_path):
         pkg = build_package(tmp_path)
@@ -1101,5 +1128,6 @@ def test_each_cluster_cpu_source_reads_the_socket_meter_srt_slurm_writes(monkeyp
 
     sources = get_args(CpuPowerSource)
     assert set(SOCKET_METERS) == set(sources)
-    for source in sources:
+    # The pinned srt-slurm has no spbm: 901-spbm-cpu-power.patch adds it to a job's clone.
+    for source in set(sources) & set(PRIMARY_KIND_BY_SOURCE):
         assert SOCKET_METERS[source].sensor_suffix == SENSOR_SUFFIXES[PRIMARY_KIND_BY_SOURCE[source]]

@@ -4,11 +4,12 @@ srt-slurm's ``cpu_power_exporter`` leg writes ``power/cpu/samples.csv`` beside
 the GPU package (srt-slurm ``src/srtctl/core/power/cpu_session.py``); its
 ``cpu_manifest.json`` is debugging metadata and is not read. Both accepted
 schemas are the wide format: one row per (scrape, host, socket) whose ``sensor`` names the
-socket meter of its source, the Grace socket meter for ACPI or the AMD EPYC package
-counter for RAPL. ACPI rows also carry the component rails of that socket in
-``cpu_rail_w`` / ``soc_w``; RAPL rows carry none. Schema v3 (srt-slurm v2.59.0+) adds
-``module_w``, NVML superchip module power; the module contains both GPUs, so it is
-published as its own rail and never added to the CPU or GPU totals.
+socket meter of its source, the Grace socket meter for ACPI, the AMD EPYC package
+counter for RAPL or a DGX Spark's core clusters for SPBM. ACPI rows also carry the
+component rails of that socket in ``cpu_rail_w`` / ``soc_w``; RAPL and SPBM rows carry
+none. Schema v3 (srt-slurm v2.59.0+) adds ``module_w``, NVML superchip module power or,
+from SPBM, the Spark's SoC package; either contains the GPUs, so it is published as its
+own rail and never added to the CPU or GPU totals.
 
 Each socket's meter series is integrated over the GPU leg's bound formal
 window with the shared trapezoid and boundary interpolation and published as
@@ -60,9 +61,6 @@ _SCHEMA_VERSION_BY_HEADER = {
     (*_CPU_SAMPLES_HEADER_V2[:-1], "module_w", "total_power_w"): 3,
 }
 
-# Two sockets per worker host: a GB200/GB300 compute tray or a dual AMD EPYC host.
-SOCKETS_PER_HOST = 2
-
 
 class SocketMeter(NamedTuple):
     """The headline per-socket meter of one exporter source.
@@ -72,21 +70,27 @@ class SocketMeter(NamedTuple):
 
     sensor_suffix: str
     sensor_kind: str
+    sockets_per_host: int
 
 
 SENSOR_GRACE = "grace_socket"
 SENSOR_RAPL = "rapl_package"
+SENSOR_SPARK = "spark_cores"
 # srt-slurm cpu_sample.PRIMARY_KIND_BY_SOURCE. ACPI reads "Grace Power Socket N", the whole
 # socket (CPU rail, SysIO, LPDDR5X and regulator loss); RAPL reads the AMD package energy
-# counter, which the kernel gives no DRAM domain.
+# counter, which the kernel gives no DRAM domain; SPBM reads the two core clusters of a DGX
+# Spark's one socket, without its SoC, memory or GPU. A GB200/GB300 compute tray and a dual
+# AMD EPYC host have two sockets.
 SOCKET_METERS = {
-    "acpi": SocketMeter("cpuSidePowerUsageW", SENSOR_GRACE),
-    "rapl": SocketMeter("packagePowerUsageW", SENSOR_RAPL),
+    "acpi": SocketMeter("cpuSidePowerUsageW", SENSOR_GRACE, sockets_per_host=2),
+    "rapl": SocketMeter("packagePowerUsageW", SENSOR_RAPL, sockets_per_host=2),
+    "spbm": SocketMeter("coresPowerUsageW", SENSOR_SPARK, sockets_per_host=1),
 }
 SENSOR_KINDS = frozenset(meter.sensor_kind for meter in SOCKET_METERS.values())
 # Wide-format rail column -> published rail family: "CPU Power Socket N" (cores,
-# no SysIO), "SysIO Power Socket N" and the v3 NVML superchip module. dram_w
-# stays blank on NVL72 firmware; module_w is blank when NVML is unavailable.
+# no SysIO), "SysIO Power Socket N" and the v3 NVML superchip module or Spark SoC
+# package. dram_w stays blank on NVL72 firmware; module_w is blank when the exporter served
+# no module reading.
 RAIL_COLUMNS = {"cpu_rail_w": "cpu_rail", "soc_w": "cpu_sysio", "module_w": "module"}
 
 _INTEGRATION_METHOD = "per_socket_trapezoidal_with_linear_boundary_interpolation"
@@ -110,6 +114,7 @@ class CpuPowerAudit:
     valid: bool = False
     sensor_kind: str | None = None
     source: str | None = None
+    sockets_per_host: int | None = None
     expected_sockets: int = 0
     observed_sockets: int = 0
     sample_row_count: int = 0
@@ -130,7 +135,7 @@ class CpuPowerAudit:
             "reason_codes": list(self.reason_codes),
             "sensor_kind": self.sensor_kind,
             "source": self.source,
-            "sockets_per_host": SOCKETS_PER_HOST,
+            "sockets_per_host": self.sockets_per_host,
             "expected_sockets": self.expected_sockets,
             "observed_sockets": self.observed_sockets,
             "sample_row_count": self.sample_row_count,
@@ -269,9 +274,12 @@ def validate_cpu_leg(
     series, sources, duplicate = _socket_series(rows)
     if duplicate or len(sources) > 1:
         audit.invalidate("cpu_samples_malformed")
-    expected_keys = {
-        (host, socket) for host in expected_hosts for socket in range(SOCKETS_PER_HOST)
-    }
+    expected_keys: set[SocketKey] = set()
+    if len(sources) == 1:
+        audit.sockets_per_host = SOCKET_METERS[next(iter(sources))].sockets_per_host
+        expected_keys = {
+            (host, socket) for host in expected_hosts for socket in range(audit.sockets_per_host)
+        }
     audit.expected_sockets = len(expected_keys)
     audit.observed_sockets = len(series)
     if window is None:

@@ -99,6 +99,9 @@ inside the checkpoint. The launcher pins an AgentX point to the golden acceptanc
 `spec-synth-len`; an eval-only point keeps its real acceptance and first runs the report-only
 [speculative acceptance gate](../infx/evals/EVALS.md#speculative-acceptance-gate).
 
+A [changelog](../perf-changelog.yaml) entry added here links this repository's pull request,
+`https://github.com/SemiAnalysisAI/InferenceX-local/pull/<number>`.
+
 ## Models
 
 | Model | Prefix | Date added | Active scenarios |
@@ -174,6 +177,15 @@ GPU allocations, so recipes must also leave room. Enroot's `/tmp` is a tmpfs in 
 [cluster profile](../configs/runners.yaml) points `TMPDIR` at `/var/tmp`. Load Pyxis with
 `container_scope=job` so a job's root filesystem is removed when it ends. On Ubuntu 24.04,
 `enroot-nsenter` needs the AppArmor profile the enroot package installs to create user namespaces.
+
+A stock DGX Spark exposes no CPU power. The `spbm` kernel module of
+[antheas/spark_hwmon](https://github.com/antheas/spark_hwmon) exposes its firmware's power
+telemetry as a hwmon device. Install commit `352c76e538cadece0e4887a153fef95f8f5ea1d4` through
+DKMS as that repository's README describes, after updating the firmware with `fwupdmgr`. With
+Secure Boot on, enrol the DKMS signing key (`mokutil --import`) so the module loads at boot.
+[`901-spbm-cpu-power.patch`](../runners/srt-slurm/patches/README.md) makes srt-slurm read the
+module's energy counters. Results then carry the two core clusters as CPU power and the SoC
+package, which includes the GPU, as module power.
 
 ### Apple silicon hosts without a container runtime (`scheduler: native`)
 

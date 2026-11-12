@@ -17,7 +17,7 @@ from infx import yamlio
 from infx.config import git_path_at_ref
 from infx.matrix.validation import ChangelogEntry
 
-CANONICAL_PR_LINK = re.compile(r"https://github\.com/SemiAnalysisAI/InferenceX/pull/\d+")
+CANONICAL_PR_LINK = re.compile(r"https://github\.com/SemiAnalysisAI/InferenceX(-local)?/pull/\d+")
 PR_LINK_PLACEHOLDERS = {
     "XXX",
     "https://github.com/SemiAnalysisAI/InferenceX/pull/XXX",
@@ -110,9 +110,10 @@ def validate_added_pr_link(link: str, pr_number: int | None) -> None:
         return
 
     expected = f"https://github.com/SemiAnalysisAI/InferenceX/pull/{pr_number}"
-    if link not in PR_LINK_PLACEHOLDERS and link != expected:
+    local = f"https://github.com/SemiAnalysisAI/InferenceX-local/pull/{pr_number}"
+    if link not in PR_LINK_PLACEHOLDERS and link not in (expected, local):
         raise ChangelogValidationError(
-            f"new PR entry must use {expected!r} or an XXX placeholder; found {link!r}"
+            f"new PR entry must use {expected!r}, {local!r} or an XXX placeholder; found {link!r}"
         )
 
 

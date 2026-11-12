@@ -40,7 +40,7 @@ SHARED_BLOCKS = {
 BOUND_RECIPE = "recipe.yaml"
 TELEMETRY_BLOCK = Path("configs/srt-recipes/telemetry-dcgm.yaml")
 # The CPU power exporter sources a cluster declares (srt-slurm.cpu-power-exporter).
-CpuPowerSource = Literal["acpi", "rapl"]
+CpuPowerSource = Literal["acpi", "rapl", "spbm"]
 NATIVE_TELEMETRY_BLOCK = Path("configs/srt-recipes/telemetry-native.yaml")
 VIDEO_BLOCK = Path("configs/srt-recipes/video.yaml")
 # How a recipe measures GPU power: the DCGM telemetry block with its exporter on this port, or

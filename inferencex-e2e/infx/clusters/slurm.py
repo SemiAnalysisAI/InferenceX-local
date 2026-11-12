@@ -160,8 +160,8 @@ class CpuPowerExporter(Record):
     """The CPU power exporter srt-slurm scrapes on this cluster's nodes.
 
     A point that selects ``cpu-power`` binds ``telemetry.cpu_power_exporter`` with this source.
-    ACPI serves the Grace socket meter and RAPL the AMD EPYC package counter, the meters the
-    CPU leg integrates.
+    ACPI serves the Grace socket meter, RAPL the AMD EPYC package counter and SPBM a DGX
+    Spark's core clusters, the meters the CPU leg integrates.
     """
 
     source: CpuPowerSource
