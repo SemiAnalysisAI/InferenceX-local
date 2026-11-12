@@ -277,8 +277,11 @@ class _ForkServer:
         return self
 
     def kill(self) -> None:
-        """Kill the server and its forks, ignoring a server that already exited."""
-        with suppress(ProcessLookupError):
+        """Kill the server and its forks, ignoring a server that already exited.
+
+        macOS answers EPERM rather than ESRCH for a group holding only zombies.
+        """
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(self._process.pid, signal.SIGKILL)
 
     def __exit__(self, error_type: type[BaseException] | None, *_: object) -> None:
