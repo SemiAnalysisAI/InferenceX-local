@@ -1025,6 +1025,27 @@ def test_added_lines_reject_deleting_a_line_that_starts_with_dashes(commit_chang
         process_changelog.get_added_lines(base, head, "perf-changelog.yaml")
 
 
+def test_added_lines_allow_a_pr_link_corrected_in_place_beside_a_new_entry(commit_changelog):
+    base = commit_changelog("- config-keys: [a]\n  pr-link: XXX\n")
+    head = commit_changelog(
+        "- config-keys: [a]\n  pr-link: https://example.com/pull/1\n"
+        "\n- config-keys: [b]\n  pr-link: https://example.com/pull/2\n"
+    )
+    added = process_changelog.get_added_lines(base, head, "perf-changelog.yaml")
+    assert added == "\n- config-keys: [b]\n  pr-link: https://example.com/pull/2"
+
+
+@pytest.mark.parametrize(
+    "head",
+    ["- config-keys: [a]\n  description: [x]\n- config-keys: [b]\n", "- config-keys: [a]\n- config-keys: [b]\n"],
+    ids=["replaced-by-another-field", "removed"],
+)
+def test_added_lines_reject_a_pr_link_that_is_not_corrected_in_place(commit_changelog, head):
+    base = commit_changelog("- config-keys: [a]\n  pr-link: XXX\n- config-keys: [b]\n")
+    with pytest.raises(ValueError, match="Deletions are not allowed.*Found deleted line:   pr-link: XXX"):
+        process_changelog.get_added_lines(base, commit_changelog(head), "perf-changelog.yaml")
+
+
 def test_added_lines_keep_an_added_line_that_starts_with_pluses(commit_changelog):
     base = commit_changelog("- a\n")
     head = commit_changelog("- a\n++ b\n")

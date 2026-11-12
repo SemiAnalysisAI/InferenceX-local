@@ -376,6 +376,8 @@ clusters:
         volume-mounts:
           aiperf-cache: /aiperf_mmap_cache
           hf-hub-cache: /hf_hub_cache
+        # Needs the spbm kernel module on the host (docs/LOCAL.md).
+        cpu-power-exporter: {source: spbm}
   m5ultra-exo:
     gpus-per-node: 1
     arch: aarch64

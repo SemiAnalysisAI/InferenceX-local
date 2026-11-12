@@ -1,0 +1,942 @@
+diff --git a/docs/cpu-power-telemetry.md b/docs/cpu-power-telemetry.md
+index 7f784de7..7dc2a2d3 100644
+--- a/docs/cpu-power-telemetry.md
++++ b/docs/cpu-power-telemetry.md
+@@ -1,8 +1,8 @@
+ # CPU Power Telemetry
+ 
+-Host-side CPU power collection for NVIDIA Grace nodes and, through RAPL, x86
+-hosts such as AMD EPYC, run alongside GPU DCGM power telemetry as an
+-independent, best-effort leg.
++Host-side CPU power collection for NVIDIA Grace nodes, x86 hosts such as AMD
++EPYC (through RAPL) and a DGX Spark (through SPBM), run alongside GPU DCGM power
++telemetry as an independent, best-effort leg.
+ 
+ ## Table of Contents
+ 
+@@ -44,7 +44,7 @@ telemetry:
+   enabled: true                # master switch; also gates GPU DCGM power telemetry
+   cpu_power_exporter:
+     port: 9405                 # default; exporter listen port / collector scrape port
+-    source: auto                # "auto" | "acpi" | "dcgm" | "rapl", passed to the exporter binary
++    source: auto                # "auto" | "acpi" | "dcgm" | "rapl" | "spbm"; all but "spbm" go to the exporter binary
+ ```
+ 
+ `telemetry.enabled: true` does not require `dcgm_exporter`. A recipe that
+@@ -79,9 +79,10 @@ srun --nodes=<N> --ntasks=<N> --nodelist=<nodes> \
+ The binary is resolved via `_resolve_bundled_binary("cpu-power-exporter")` — a
+ Rust binary installed by `make setup`. When that binary is absent or not
+ executable, srtctl falls back to a Python stdlib exporter
+-(`python3 -m srtctl.core.cpu_power_exporter`), which is ACPI-only and has no
+-`--source` flag; a non-`auto` `source` request logs a warning in that case
+-instead of being silently dropped.
++(`python3 -m srtctl.core.cpu_power_exporter`), which as a fallback serves ACPI
++only; a non-`auto` `source` request logs a warning in that case instead of
++being silently dropped. `spbm` always runs on the Python exporter, even when
++the binary is installed.
+ 
+ Once the exporter tasks are launched, `CpuPowerCollector.start()` resolves
+ each worker's IP (`get_hostname_ip`, respecting `runtime.network_interface`),
+@@ -98,7 +99,7 @@ the source of truth).
+ 
+ ## Collection Sources
+ 
+-The exporter binary itself picks its source from its own `--source` flag:
++The exporter picks its source from its `--source` flag:
+ 
+ - **`acpi`** — reads Linux ACPI `power_meter` hwmon sysfs channels. The driver
+   name can be on the hwmon node or under `device/`: `acpi_power_meter` used
+@@ -199,6 +200,23 @@ The exporter binary itself picks its source from its own `--source` flag:
+   and the energy report warns that a RAPL run is not comparable with
+   ACPI-mode runs. `power_w` is the socket's package power and
+   `total_power_w` sums the sockets.
++- **`spbm`** — reads a DGX Spark's System Power Budget Manager energy counters
++  through the `spbm` hwmon driver
++  ([antheas/spark_hwmon](https://github.com/antheas/spark_hwmon)), an
++  out-of-tree module the host must have loaded. The machine has no ACPI power
++  meter, DCGM CPU entity or RAPL zone. The exporter finds the hwmon node named
++  `spbm` and its `energy*_input` counters labelled `cpu_p` and `cpu_e` (the
++  performance and efficiency core clusters) and `pkg` (the SoC package). It
++  polls them once a second and publishes the average power since the previous
++  poll, because the driver's power channels are instantaneous and swing with
++  the firmware's 100 ms control loop. The counters are 32-bit millijoules,
++  which wrap after about 12 hours at 100 W, and a delta is carried across the
++  wrap. The two clusters summed are socket 0's `power_w` (rail kind `cores`,
++  sensor `CPU0:coresPowerUsageW`); the package is its `module_w`, because like
++  an NVML module reading it includes the GPU. `cores` is the narrowest boundary
++  of any source (no SoC, memory or GPU), so the energy report warns that an
++  SPBM run is not comparable with ACPI-mode runs. Only the Python exporter
++  serves this source.
+ - **`auto`** (default) — walks a fixed ladder at startup, most informative
+   source first, and each source must prove itself before it is used. Every
+   step down is logged at WARN in the exporter's `.out` file with the reason:
+@@ -232,13 +250,14 @@ The exporter binary itself picks its source from its own `--source` flag:
+   requires the liveness probe to pass; DCGM still tries 1130+1132 then 1130)
+   and exit non-zero instead of stepping down. The Python host collector
+   (`srtctl.core.cpu_power`) implements the same ladder. `auto` never
+-  selects `rapl`; it runs only when named.
++  selects `rapl` or `spbm`; each runs only when named.
+ 
+ The exporter resolves this once at process startup and serves only one base
+-metric family (`cpu_power_dcgm_watts`, `cpu_power_acpi_watts` or
+-`cpu_power_rapl_watts`) for its lifetime. If a scrape body ever contained
+-more than one, client-side parsing (`src/srtctl/core/power/cpu_parser.py`)
+-prefers ACPI, since it carries more detail, then DCGM, then RAPL.
++metric family (`cpu_power_dcgm_watts`, `cpu_power_acpi_watts`,
++`cpu_power_rapl_watts` or `cpu_power_spbm_watts`) for its lifetime. If a
++scrape body ever contained more than one, client-side parsing
++(`src/srtctl/core/power/cpu_parser.py`) prefers ACPI, since it carries more
++detail, then DCGM, then RAPL, then SPBM.
+ 
+ With `acpi` or `dcgm` the exporter also serves superchip module power from
+ NVML. It does not with `rapl`: the meter is a Grace superchip reading, and on
+@@ -325,7 +344,7 @@ per socket per scrape. Schema v3 has header:
+ schema_version, timestamp_unix, hostname, source, sensor, socket_id, power_w, cpu_rail_w, soc_w, dram_w, module_w, total_power_w
+ ```
+ 
+-- **`power_w`**: the socket primary reading. ACPI uses the `total` envelope; DCGM uses field 1130, the CPU rail. A socket without its primary reading gets no row.
++- **`power_w`**: the socket primary reading. ACPI uses the `total` envelope; DCGM uses field 1130, the CPU rail; SPBM uses `cores`, the two core clusters. A socket without its primary reading gets no row.
+ - **`cpu_rail_w`, `soc_w`, `dram_w`**: component rails, blank when absent. ACPI fills those its firmware exposes; DCGM fills `cpu_rail_w` (= `power_w`, field 1130) and `soc_w` (field 1132). Zero or non-finite readings are missing, never interpreted as idle power. Component rails never substitute for `power_w` or add to `total_power_w`.
+ - **`total_power_w`**: the sum of `power_w` across the node's sockets, repeated on each socket row. ACPI totals measure the socket envelope; DCGM totals sum CPU rails and are not directly comparable. Hardware
+   traces show the `total` rail at roughly 93-104W against `cpu_rail`+`soc`
+@@ -336,8 +355,8 @@ schema_version, timestamp_unix, hostname, source, sensor, socket_id, power_w, cp
+   summed into `total_power_w`. Consumers that want the whole superchip use
+   `module_w` and must not add GPU power on top, because the GPUs are already
+   inside it. It is blank when no module reading arrived. The row's `source`
+-  and `sensor` columns describe `power_w`. `module_w` always comes from
+-  `cpu_power_nvml_watts`.
++  and `sensor` columns describe `power_w`. `module_w` comes from
++  `cpu_power_nvml_watts`, or in SPBM mode from the SoC package counter.
+ 
+ v1 wrote one row per rail with no rail columns. v2 pivoted to one row per
+ socket. v3 appended `module_w`. Readers accept all three.
+diff --git a/docs/schema-reference.md b/docs/schema-reference.md
+index 8f6d1f30..9c2f91c9 100644
+--- a/docs/schema-reference.md
++++ b/docs/schema-reference.md
+@@ -489,7 +489,7 @@ Best-effort CPU power collection via the cpu-power-exporter binary.
+ | Key | Type | Default | Description |
+ |---|---|---|---|
+ | `port` | int | `9405` | TCP port the per-node exporter listens on for ``/metrics``. |
+-| `source` | one of `'auto'`, `'acpi'`, `'dcgm'`, `'rapl'` | `'auto'` | Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` \| ``acpi`` \| ``dcgm`` \| ``rapl``). ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as "CPU rail only". ``rapl`` reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon), whose ``energy_uj`` files are root-only unless a cluster admin grants read access; ``auto`` never selects it. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only. |
++| `source` | one of `'auto'`, `'acpi'`, `'dcgm'`, `'rapl'`, `'spbm'` | `'auto'` | Power reading back-end (``auto`` \| ``acpi`` \| ``dcgm`` \| ``rapl`` \| ``spbm``), passed through to the bundled Rust binary's own ``--source`` flag for all but ``spbm``. ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as "CPU rail only". ``rapl`` reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon), whose ``energy_uj`` files are root-only unless a cluster admin grants read access; ``auto`` never selects it. ``spbm`` reads a DGX Spark's core-cluster and SoC package energy counters from the ``spbm`` hwmon driver; only the Python stdlib exporter serves it, so it runs there even when the binary is installed, and ``auto`` never selects it. Any other value is ignored when the Python stdlib exporter runs as the fallback for a missing binary: as a fallback it is ACPI-only. |
+ 
+ ### CpuPowerConfig
+ 
+diff --git a/docs/schema/recipe.schema.json b/docs/schema/recipe.schema.json
+index 2449b3fb..f4328bd2 100644
+--- a/docs/schema/recipe.schema.json
++++ b/docs/schema/recipe.schema.json
+@@ -697,9 +697,10 @@
+             "auto",
+             "acpi",
+             "dcgm",
+-            "rapl"
++            "rapl",
++            "spbm"
+           ],
+-          "description": "Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` | ``acpi`` | ``dcgm`` | ``rapl``). ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as \"CPU rail only\". ``rapl`` reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon), whose ``energy_uj`` files are root-only unless a cluster admin grants read access; ``auto`` never selects it. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only.",
++          "description": "Power reading back-end (``auto`` | ``acpi`` | ``dcgm`` | ``rapl`` | ``spbm``), passed through to the bundled Rust binary's own ``--source`` flag for all but ``spbm``. ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as \"CPU rail only\". ``rapl`` reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon), whose ``energy_uj`` files are root-only unless a cluster admin grants read access; ``auto`` never selects it. ``spbm`` reads a DGX Spark's core-cluster and SoC package energy counters from the ``spbm`` hwmon driver; only the Python stdlib exporter serves it, so it runs there even when the binary is installed, and ``auto`` never selects it. Any other value is ignored when the Python stdlib exporter runs as the fallback for a missing binary: as a fallback it is ACPI-only.",
+           "default": "auto"
+         }
+       },
+diff --git a/src/srtctl/analysis/power_energy_report.py b/src/srtctl/analysis/power_energy_report.py
+index 4fb12dda..419d51e5 100644
+--- a/src/srtctl/analysis/power_energy_report.py
++++ b/src/srtctl/analysis/power_energy_report.py
+@@ -59,6 +59,12 @@ RAPL_PACKAGE_WARNING = (
+     "memory): not comparable with ACPI-mode runs"
+ )
+ 
++# SPBM-mode CPU power is a DGX Spark's two core clusters only: the narrowest
++# boundary of any source, without the SoC, memory or GPU.
++SPBM_CORES_WARNING = (
++    "CPU power source is the DGX Spark's core clusters (no SoC, memory or GPU): not comparable with ACPI-mode runs"
++)
++
+ GPU_UTILIZATION_COLUMNS = tuple(metric.column for metric in UTILIZATION_METRICS)
+ 
+ # Directory names whose samples.csv is CPU power: "cpu" is the head-node
+@@ -464,8 +470,8 @@ class CpuSamples:
+     per_socket: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]]
+     per_node: dict[str, tuple[np.ndarray, np.ndarray]]
+     per_socket_utilization: dict[tuple[str, int], UtilizationSeries] = field(default_factory=dict)
+-    # Origins seen in the CSV's ``source`` column ("acpi" / "dcgm" / "rapl");
+-    # drive the DCGM and RAPL boundary warnings. Empty for hand-built fixtures.
++    # Origins seen in the CSV's ``source`` column ("acpi" / "dcgm" / "rapl" / "spbm");
++    # drive the DCGM, RAPL and SPBM boundary warnings. Empty for hand-built fixtures.
+     sources: frozenset[str] = frozenset()
+ 
+ 
+@@ -897,6 +903,8 @@ def build_concurrency_report(
+             warnings.append(DCGM_CPU_RAIL_ONLY_WARNING)
+         if "rapl" in cpu_samples.sources:
+             warnings.append(RAPL_PACKAGE_WARNING)
++        if "spbm" in cpu_samples.sources:
++            warnings.append(SPBM_CORES_WARNING)
+         cpu_utilization = _summarize_utilization(
+             cpu_samples.per_socket_utilization,
+             device_label="cpu/{host}/socket{index}",
+diff --git a/src/srtctl/cli/mixins/telemetry_stage.py b/src/srtctl/cli/mixins/telemetry_stage.py
+index e1238c4d..1ee52d48 100644
+--- a/src/srtctl/cli/mixins/telemetry_stage.py
++++ b/src/srtctl/cli/mixins/telemetry_stage.py
+@@ -15,6 +15,7 @@ from collections.abc import Callable
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
++from srtctl.core.cpu_power_exporter import PYTHON_ONLY_SOURCES
+ from srtctl.core.cpu_power_session import CpuPowerSessionSettings as CpuPowerHostSessionSettings
+ from srtctl.core.cpu_power_session import CpuPowerTelemetrySession
+ from srtctl.core.git_state import head_commit
+@@ -389,16 +390,20 @@ class TelemetryStageMixin:
+         port = telemetry.cpu_power_exporter.port
+         source = telemetry.cpu_power_exporter.source
+         resolved = self._resolve_bundled_binary("cpu-power-exporter")
+-        if Path(resolved).is_file() and os.access(resolved, os.X_OK):
++        python_exporter = ["python3", "-m", "srtctl.core.cpu_power_exporter", "--port", str(port)]
++        if source in PYTHON_ONLY_SOURCES:
++            exporter_command = [*python_exporter, "--source", source]
++            logger.info("CPU power exporter: only the Python exporter serves source %s", source)
++        elif Path(resolved).is_file() and os.access(resolved, os.X_OK):
+             exporter_command = [resolved, "--port", str(port), "--source", source]
+             logger.info("CPU power exporter: using Rust binary %s", resolved)
+         else:
+-            exporter_command = ["python3", "-m", "srtctl.core.cpu_power_exporter", "--port", str(port)]
++            exporter_command = python_exporter
+             logger.info("CPU power exporter: Rust binary not found, falling back to Python exporter")
+             if source != "auto":
+                 logger.warning(
+-                    "telemetry.cpu_power_exporter.source=%r requested, but the Python fallback exporter is "
+-                    "ACPI-only and has no --source flag; this request cannot be honored",
++                    "telemetry.cpu_power_exporter.source=%r requested, but the Python fallback exporter "
++                    "serves ACPI only; this request cannot be honored",
+                     source,
+                 )
+ 
+diff --git a/src/srtctl/core/cpu_power_exporter.py b/src/srtctl/core/cpu_power_exporter.py
+index 6936f8e0..2aae539d 100644
+--- a/src/srtctl/core/cpu_power_exporter.py
++++ b/src/srtctl/core/cpu_power_exporter.py
+@@ -1,14 +1,20 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-"""Minimal Prometheus exporter for Grace CPU power via ACPI hwmon.
++"""Minimal Prometheus exporter for CPU power via hwmon.
+ 
+ Runs on the host (not inside a container) so /sys/class/hwmon is visible.
+ Exposes metrics on :9405/metrics by default, readable by AIPerf's
+ DCGMTelemetryCollector or a dedicated CPUPowerTelemetryCollector.
+ 
++One source per process (``--source``):
++    acpi  Grace CPU power from ACPI ``power_meter`` channels
++    spbm  DGX Spark core-cluster and SoC package power from the ``spbm``
++          driver's energy counters
++
+ Metric names:
+     cpu_power_acpi_watts{socket, oem_info, source}   -- per-channel power (W)
++    cpu_power_spbm_watts{type, socket, source}       -- power averaged between polls (W)
+ 
+ Usage:
+     python3 -m srtctl.core.cpu_power_exporter --port 9405
+@@ -23,12 +29,28 @@ import math
+ import signal
+ import sys
+ import threading
++import time
++from collections.abc import Callable
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ from pathlib import Path
+ from typing import Any, ClassVar
+ 
+-from srtctl.core.power.cpu_rails import OTHER_KIND, classify_acpi_label
+-from srtctl.core.power.hwmon import is_power_meter
++from srtctl.core.power.cpu_rails import CORES_KIND, MODULE_KIND, OTHER_KIND, classify_acpi_label
++from srtctl.core.power.hwmon import has_name, is_power_meter
++
++SPBM_HWMON_NAME = "spbm"
++# The energy counter labels summed into each published rail kind. The package includes the GPU.
++SPBM_COUNTERS: dict[str, tuple[str, ...]] = {CORES_KIND: ("cpu_p", "cpu_e"), MODULE_KIND: ("pkg",)}
++# The firmware counts 32-bit millijoules, which the driver reports as microjoules.
++SPBM_COUNTER_RANGE_UJ = 2**32 * 1000
++SPBM_POLL_SECONDS = 1.0
++# The gap between the two reads that give the first scrape a value.
++SPBM_PRIME_SECONDS = 0.2
++
++
++class SourceUnavailable(RuntimeError):
++    """The host has nothing for the requested source to read."""
++
+ 
+ # Channel classification is shared with the scraper and host collector via
+ # cpu_rails so the published ``type`` label uses the canonical rail kinds
+@@ -107,8 +129,103 @@ def _build_metrics(sensors: list[dict[str, Any]]) -> str:
+     return "\n".join(lines)
+ 
+ 
++class SpbmCounters:
++    """A DGX Spark's SPBM energy counters as watts averaged between two polls.
++
++    The ``spbm`` hwmon driver (https://github.com/antheas/spark_hwmon) exposes them. Its
++    power channels are instantaneous and swing with the firmware's 100 ms control loop, so
++    an average needs the counters.
++    """
++
++    def __init__(self, hwmon_root: Path = Path("/sys/class/hwmon")) -> None:
++        hwmon = next((d for d in sorted(hwmon_root.glob("hwmon*")) if has_name(d, SPBM_HWMON_NAME)), None)
++        if hwmon is None:
++            raise SourceUnavailable(f"no {SPBM_HWMON_NAME} hwmon device found")
++        by_label = {
++            label: path.with_name(path.name.removesuffix("_label") + "_input")
++            for path in sorted(hwmon.glob("energy*_label"))
++            if (label := _read_text(path)) is not None
++        }
++        wanted = [label for labels in SPBM_COUNTERS.values() for label in labels]
++        missing = [label for label in wanted if label not in by_label]
++        if missing:
++            raise SourceUnavailable(f"{hwmon} has no energy counter labelled {', '.join(missing)}")
++        self._paths = {label: by_label[label] for label in wanted}
++        self._baseline: tuple[float, dict[str, int]] | None = None
++        self._watts: dict[str, float] = {}
++
++    def poll(self, now: float) -> None:
++        """Read every counter and publish each kind's average power since the previous read.
++
++        A poll that cannot read every counter publishes nothing, and neither does the poll after
++        it, which only takes a new baseline.
++        """
++        energies = self._read()
++        watts: dict[str, float] = {}
++        if energies is not None and self._baseline is not None:
++            then, before = self._baseline
++            watts = {
++                kind: sum((energies[label] - before[label]) % SPBM_COUNTER_RANGE_UJ for label in labels)
++                / 1_000_000.0
++                / (now - then)
++                for kind, labels in SPBM_COUNTERS.items()
++            }
++        self._baseline = None if energies is None else (now, energies)
++        self._watts = watts
++
++    def _read(self) -> dict[str, int] | None:
++        energies: dict[str, int] = {}
++        for label, path in self._paths.items():
++            try:
++                energies[label] = int(path.read_text())
++            except (OSError, ValueError):
++                return None
++        return energies
++
++    def render(self) -> str:
++        lines = [
++            "# HELP cpu_power_spbm_watts DGX Spark power averaged from SPBM energy counters (W).",
++            "# TYPE cpu_power_spbm_watts gauge",
++        ]
++        for kind, watts in self._watts.items():
++            lines.append(f'cpu_power_spbm_watts{{type="{kind}",socket="0",source="spbm"}} {watts:.6f}')
++        lines.append("")
++        return "\n".join(lines)
++
++
++def _open_acpi() -> Callable[[], str]:
++    sensors = _find_power_meter_sensors()
++    if not sensors:
++        raise SourceUnavailable("no ACPI power_meter hwmon sensors found")
++    print(f"Found {len(sensors)} sensor(s):", file=sys.stderr)
++    for s in sensors:
++        print(f"  [{s['type']}] socket={s['socket']}  {s['oem']}  ({s['path']})", file=sys.stderr)
++    return lambda: _build_metrics(sensors)
++
++
++def _open_spbm() -> Callable[[], str]:
++    counters = SpbmCounters()
++    counters.poll(time.monotonic())
++    time.sleep(SPBM_PRIME_SECONDS)
++    counters.poll(time.monotonic())
++
++    def poll_forever() -> None:
++        while True:
++            time.sleep(SPBM_POLL_SECONDS)
++            counters.poll(time.monotonic())
++
++    threading.Thread(target=poll_forever, daemon=True).start()
++    return counters.render
++
++
++# Each opener returns the function that renders a ``/metrics`` body, or raises SourceUnavailable.
++SOURCES: dict[str, Callable[[], Callable[[], str]]] = {"acpi": _open_acpi, "spbm": _open_spbm}
++# The bundled cpu-power-exporter binary does not serve these.
++PYTHON_ONLY_SOURCES = frozenset({"spbm"})
++
++
+ class _Handler(BaseHTTPRequestHandler):
+-    sensors: ClassVar[list[dict[str, Any]]] = []
++    render: ClassVar[Callable[[], str]]
+ 
+     def do_GET(self) -> None:
+         if self.path not in ("/metrics", "/health"):
+@@ -121,7 +238,7 @@ class _Handler(BaseHTTPRequestHandler):
+             self.end_headers()
+             self.wfile.write(b"ok\n")
+             return
+-        body = _build_metrics(self.sensors).encode()
++        body = self.render().encode()
+         self.send_response(200)
+         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+         self.send_header("Content-Length", str(len(body)))
+@@ -132,16 +249,14 @@ class _Handler(BaseHTTPRequestHandler):
+         pass  # suppress default access log noise
+ 
+ 
+-def serve(port: int) -> int:
+-    sensors = _find_power_meter_sensors()
+-    if not sensors:
+-        print("ERROR: no ACPI power_meter hwmon sensors found", file=sys.stderr)
++def serve(port: int, source: str = "acpi") -> int:
++    try:
++        render = SOURCES[source]()
++    except SourceUnavailable as error:
++        print(f"ERROR: {error}", file=sys.stderr)
+         return 2
+-    print(f"Found {len(sensors)} sensor(s):", file=sys.stderr)
+-    for s in sensors:
+-        print(f"  [{s['type']}] socket={s['socket']}  {s['oem']}  ({s['path']})", file=sys.stderr)
+ 
+-    _Handler.sensors = sensors
++    _Handler.render = staticmethod(render)
+     server = HTTPServer(("", port), _Handler)
+     stop = threading.Event()
+ 
+@@ -160,8 +275,9 @@ def serve(port: int) -> int:
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--port", type=int, default=9405)
++    parser.add_argument("--source", choices=sorted(SOURCES), default="acpi")
+     args = parser.parse_args()
+-    return serve(args.port)
++    return serve(args.port, args.source)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/srtctl/core/power/cpu_parser.py b/src/srtctl/core/power/cpu_parser.py
+index fe49f28e..562bf4b6 100644
+--- a/src/srtctl/core/power/cpu_parser.py
++++ b/src/srtctl/core/power/cpu_parser.py
+@@ -10,17 +10,18 @@ here: it reports the socket envelope
+ plus every component rail, while DCGM can only report the rails it has
+ fields for (1130 = ``cpu_rail``, 1132 = ``soc``; no envelope), so ACPI is
+ the more informative source when both exist. DCGM is tried before RAPL,
+-which reports one ``package`` value per socket and no rails.
++which reports one ``package`` value per socket and no rails, and RAPL before
++SPBM, which reports a DGX Spark's ``cores`` and its SoC package as ``module``.
+ 
+ DCGM bodies come in two shapes. Newer exporters label each sample with the
+ DCGM ``field_id`` it read; older ones publish only field 1130 with no label.
+ Both go through :func:`cpu_sample.dcgm_rail_readings`, so an unlabelled
+ sample is filed exactly like a labelled 1130.
+ 
+-In either mode the exporter may also serve ``cpu_power_nvml_watts``, the
+-superchip module power. It is the only source of the ``module`` rail and
+-rides on the socket row of whichever base family won. A body with only NVML
+-readings has no socket power and yields an empty scrape.
++In ACPI or DCGM mode the exporter may also serve ``cpu_power_nvml_watts``,
++the superchip module power. Outside SPBM it is the only source of the
++``module`` rail and rides on the socket row of whichever base family won. A
++body with only NVML readings has no socket power and yields an empty scrape.
+ 
+ Rail vocabulary comes from :mod:`srtctl.core.power.cpu_rails`; nothing here
+ knows a firmware label by name.
+@@ -35,6 +36,7 @@ from prometheus_client.parser import text_string_to_metric_families
+ 
+ from srtctl.core.power.cpu_rails import (
+     ACPI_RAIL_KINDS,
++    CORES_KIND,
+     DCGM_FIELD_RAIL_KINDS,
+     DCGM_PRIMARY_FIELD_ID,
+     MODULE_KIND,
+@@ -56,6 +58,8 @@ DCGM_FIELD_LABEL = "field_id"
+ ACPI_METRIC = "cpu_power_acpi_watts"
+ NVML_METRIC = "cpu_power_nvml_watts"
+ RAPL_METRIC = "cpu_power_rapl_watts"
++SPBM_METRIC = "cpu_power_spbm_watts"
++SPBM_KINDS: frozenset[str] = frozenset((CORES_KIND, MODULE_KIND))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -66,7 +70,7 @@ class CpuReading:
+     sensor: str
+     socket_id: int
+     power_w: float
+-    kind: str  # cpu_rails.DCGM_KIND for dcgm; an ACPI_RAIL_KINDS member for acpi; PACKAGE_KIND for rapl; MODULE_KIND for nvml
++    kind: str  # cpu_rails.DCGM_KIND for dcgm; an ACPI_RAIL_KINDS member for acpi; PACKAGE_KIND for rapl; MODULE_KIND for nvml; a SPBM_KINDS member for spbm
+ 
+ 
+ @dataclass(frozen=True)
+@@ -79,7 +83,7 @@ class ParsedCpuScrape:
+     ``total_power_w`` is ``node_total_watts`` over those sockets.
+     """
+ 
+-    mode: str = "unknown"  # "dcgm" | "acpi" | "rapl" | "unknown"
++    mode: str = "unknown"  # "dcgm" | "acpi" | "rapl" | "spbm" | "unknown"
+     readings: tuple[CpuReading, ...] = ()
+     sockets: tuple[CpuSample, ...] = ()
+     total_power_w: float | None = None
+@@ -112,6 +116,10 @@ def parse_cpu_scrape(text: str) -> ParsedCpuScrape:
+     if rapl_readings:
+         return _scrape("rapl", rapl_readings + module_readings)
+ 
++    spbm_readings = _parse_spbm(families)
++    if spbm_readings:
++        return _scrape("spbm", spbm_readings)
++
+     return ParsedCpuScrape()
+ 
+ 
+@@ -216,6 +224,32 @@ def _parse_rapl(families) -> list[CpuReading]:
+     return readings
+ 
+ 
++def _parse_spbm(families) -> list[CpuReading]:
++    readings: list[CpuReading] = []
++    for family in families:
++        for sample in family.samples:
++            if sample.name != SPBM_METRIC:
++                continue
++            kind = sample.labels.get("type")
++            socket_id = _parse_socket(sample.labels.get("socket"))
++            if socket_id is None or kind not in SPBM_KINDS:
++                continue
++            value = sample.value
++            # A zero delta means the counter did not advance: missing, not idle.
++            if not math.isfinite(value) or value <= 0:
++                continue
++            readings.append(
++                CpuReading(
++                    source="spbm",
++                    sensor=sensor_name(kind, socket_id),
++                    socket_id=socket_id,
++                    power_w=value,
++                    kind=kind,
++                )
++            )
++    return readings
++
++
+ def _parse_nvml(families) -> list[CpuReading]:
+     readings: list[CpuReading] = []
+     for family in families:
+diff --git a/src/srtctl/core/power/cpu_rails.py b/src/srtctl/core/power/cpu_rails.py
+index 59e97599..2bf722dd 100644
+--- a/src/srtctl/core/power/cpu_rails.py
++++ b/src/srtctl/core/power/cpu_rails.py
+@@ -41,10 +41,17 @@ Rail kinds
+     different boundary: Grace's ``total`` includes its LPDDR5X memory, while
+     the kernel defines no DRAM domain for AMD and whether AMD package power
+     covers any memory is undocumented.
++``cores``
++    Not an ACPI rail: the DGX Spark's two core clusters (performance and
++    efficiency), summed from their SPBM energy counters. Treated like
++    ``total`` for ``power_w`` purposes, but it is the narrowest boundary
++    here: no SoC, memory or GPU.
+ ``module``
+-    NVML superchip power for one socket, including Grace and its GPUs. It
+-    is a reference rail and never adds to ``total_power_w``. An ACPI
+-    ``Module Power Socket N`` label remains unclassified.
++    NVML superchip power for one socket, including Grace and its GPUs; on a
++    DGX Spark, the SoC package from its SPBM energy counter, which likewise
++    includes the GPU. It is a reference rail and never adds to
++    ``total_power_w``. An ACPI ``Module Power Socket N`` label remains
++    unclassified.
+ """
+ 
+ from __future__ import annotations
+@@ -55,6 +62,7 @@ from typing import NamedTuple
+ TOTAL_KIND = "total"
+ DCGM_KIND = "dcgm"
+ PACKAGE_KIND = "package"
++CORES_KIND = "cores"
+ MODULE_KIND = "module"
+ OTHER_KIND = "other"
+ 
+@@ -107,6 +115,7 @@ SENSOR_SUFFIXES: dict[str, str] = {
+     MODULE_KIND: "modulePowerUsageW",
+     DCGM_KIND: "cpuPowerUsageW",
+     PACKAGE_KIND: "packagePowerUsageW",
++    CORES_KIND: "coresPowerUsageW",
+ }
+ _KIND_BY_SUFFIX = {suffix: kind for kind, suffix in SENSOR_SUFFIXES.items()}
+ 
+@@ -165,7 +174,14 @@ def classify_sensor(sensor: str) -> str:
+ 
+ # Preference when a legacy long-format CSV holds several rails for one socket
+ # and exactly one must feed the per-socket power series.
+-LEGACY_RAIL_PREFERENCE: tuple[str, ...] = (TOTAL_KIND, DCGM_KIND, PACKAGE_KIND, *REFERENCE_RAIL_KINDS, OTHER_KIND)
++LEGACY_RAIL_PREFERENCE: tuple[str, ...] = (
++    TOTAL_KIND,
++    DCGM_KIND,
++    PACKAGE_KIND,
++    CORES_KIND,
++    *REFERENCE_RAIL_KINDS,
++    OTHER_KIND,
++)
+ 
+ 
+ def legacy_rail_rank(sensor: str) -> int:
+diff --git a/src/srtctl/core/power/cpu_sample.py b/src/srtctl/core/power/cpu_sample.py
+index 2408c041..8135ccf9 100644
+--- a/src/srtctl/core/power/cpu_sample.py
++++ b/src/srtctl/core/power/cpu_sample.py
+@@ -20,9 +20,11 @@ Origin (``source``) decides which rail is *primary*:
+   :func:`dcgm_rail_readings`. DCGM exposes no socket envelope.
+ * ``rapl`` -- the ``package`` RAPL domain per socket, averaged from its
+   energy counter; no rails.
++* ``spbm`` -- the ``cores`` of a DGX Spark's one socket, averaged from its
++  two core-cluster energy counters; the SoC package rides along as ``module``.
+ 
+ The ``module`` rail (superchip module power, GPUs included) is a reference
+-rail too and rides on the socket row under either origin.
++rail too and rides on the socket row under any origin.
+ 
+ A socket without its primary reading is not a sample: a reference rail must
+ never stand in for the socket's power.
+@@ -34,6 +36,7 @@ from collections.abc import Iterable, Mapping
+ from dataclasses import dataclass
+ 
+ from srtctl.core.power.cpu_rails import (
++    CORES_KIND,
+     DCGM_FIELD_RAIL_KINDS,
+     DCGM_KIND,
+     DCGM_PRIMARY_FIELD_ID,
+@@ -43,7 +46,12 @@ from srtctl.core.power.cpu_rails import (
+     sensor_name,
+ )
+ 
+-PRIMARY_KIND_BY_SOURCE: dict[str, str] = {"acpi": TOTAL_KIND, "dcgm": DCGM_KIND, "rapl": PACKAGE_KIND}
++PRIMARY_KIND_BY_SOURCE: dict[str, str] = {
++    "acpi": TOTAL_KIND,
++    "dcgm": DCGM_KIND,
++    "rapl": PACKAGE_KIND,
++    "spbm": CORES_KIND,
++}
+ 
+ 
+ def primary_kind(source: str) -> str:
+@@ -61,7 +69,7 @@ class RailReading:
+     """One classified sensor value: which socket, which rail, from which sensor."""
+ 
+     socket_id: int
+-    kind: str  # cpu_rails.TOTAL_KIND / DCGM_KIND / PACKAGE_KIND / a REFERENCE_RAIL_KINDS member
++    kind: str  # cpu_rails.TOTAL_KIND / DCGM_KIND / PACKAGE_KIND / CORES_KIND / a REFERENCE_RAIL_KINDS member
+     sensor: str
+     watts: float
+ 
+diff --git a/src/srtctl/core/power/hwmon.py b/src/srtctl/core/power/hwmon.py
+index ad03ef39..7fa7bd3b 100644
+--- a/src/srtctl/core/power/hwmon.py
++++ b/src/srtctl/core/power/hwmon.py
+@@ -6,12 +6,16 @@
+ from pathlib import Path
+ 
+ 
+-def is_power_meter(hwmon_dir: Path) -> bool:
++def has_name(hwmon_dir: Path, name: str) -> bool:
+     """Accept class attributes and legacy drivers exposing only ``device/name``."""
+     for name_path in (hwmon_dir / "name", hwmon_dir / "device" / "name"):
+         try:
+-            if name_path.read_text().strip() == "power_meter":
++            if name_path.read_text().strip() == name:
+                 return True
+         except OSError:
+             continue
+     return False
++
++
++def is_power_meter(hwmon_dir: Path) -> bool:
++    return has_name(hwmon_dir, "power_meter")
+diff --git a/src/srtctl/core/schema.py b/src/srtctl/core/schema.py
+index 1e8d890d..8496c34e 100755
+--- a/src/srtctl/core/schema.py
++++ b/src/srtctl/core/schema.py
+@@ -2018,7 +2018,7 @@ class CpuPowerConfig:
+     Schema: ClassVar[type[Schema]] = Schema
+ 
+ 
+-CpuPowerExporterSource = Literal["auto", "acpi", "dcgm", "rapl"]
++CpuPowerExporterSource = Literal["auto", "acpi", "dcgm", "rapl", "spbm"]
+ 
+ 
+ @dataclass(frozen=True)
+@@ -2033,9 +2033,9 @@ class CpuPowerExporterConfig:
+ 
+     Attributes:
+         port: TCP port the per-node exporter listens on for ``/metrics``.
+-        source: Power reading back-end passed through to the bundled Rust
+-            binary's own ``--source`` flag (``auto`` | ``acpi`` | ``dcgm`` |
+-            ``rapl``).
++        source: Power reading back-end (``auto`` | ``acpi`` | ``dcgm`` |
++            ``rapl`` | ``spbm``), passed through to the bundled Rust binary's
++            own ``--source`` flag for all but ``spbm``.
+             ``auto`` tries ACPI first (the only source with the socket
+             envelope) and falls back to DCGM when no ACPI power_meter hwmon
+             sensors exist or no socket-total sensor reads positive on two
+@@ -2046,8 +2046,13 @@ class CpuPowerExporterConfig:
+             the energy report flags such runs as "CPU rail only". ``rapl``
+             reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon),
+             whose ``energy_uj`` files are root-only unless a cluster admin
+-            grants read access; ``auto`` never selects it. Has no effect when the Python stdlib fallback exporter is used instead of
+-            the binary -- that fallback is ACPI-only.
++            grants read access; ``auto`` never selects it. ``spbm`` reads a
++            DGX Spark's core-cluster and SoC package energy counters from the
++            ``spbm`` hwmon driver; only the Python stdlib exporter serves it,
++            so it runs there even when the binary is installed, and ``auto``
++            never selects it. Any other value is ignored when the Python stdlib
++            exporter runs as the fallback for a missing binary: as a fallback
++            it is ACPI-only.
+     """
+ 
+     # Port the exporter listens on and the head-node collector scrapes.
+diff --git a/tests/test_cpu_power.py b/tests/test_cpu_power.py
+index f3a2a2ec..609ed9b6 100644
+--- a/tests/test_cpu_power.py
++++ b/tests/test_cpu_power.py
+@@ -25,7 +25,12 @@ from srtctl.core.cpu_power import (
+     _add_standard_dcgm_binding_path,
+     format_local_timestamp,
+ )
+-from srtctl.core.cpu_power_exporter import _build_metrics, _find_power_meter_sensors
++from srtctl.core.cpu_power_exporter import (
++    SourceUnavailable,
++    SpbmCounters,
++    _build_metrics,
++    _find_power_meter_sensors,
++)
+ from srtctl.core.cpu_power_session import CpuPowerSessionSettings, CpuPowerTelemetrySession
+ from srtctl.core.power.cpu_rails import COMPONENT_RAIL_COLUMN_NAMES
+ from srtctl.core.power.cpu_sample import CpuSample, RailReading
+@@ -155,6 +160,86 @@ def test_exporter_discovers_legacy_hwmon_without_class_name(tmp_path: Path) -> N
+     assert 'source="acpi"} 88.706000' in _build_metrics(sensors)
+ 
+ 
++def _make_spbm(root: Path, **microjoules: int) -> Path:
++    """An ``spbm`` hwmon node with one energy counter per label, beside an unrelated node."""
++    (root / "hwmon0").mkdir()
++    (root / "hwmon0" / "name").write_text("acpitz\n")
++    hwmon = root / "hwmon6"
++    hwmon.mkdir()
++    (hwmon / "name").write_text("spbm\n")
++    for index, (label, value) in enumerate(microjoules.items(), start=1):
++        (hwmon / f"energy{index}_label").write_text(f"{label}\n")
++        (hwmon / f"energy{index}_input").write_text(f"{value}\n")
++    return hwmon
++
++
++def _set_spbm(hwmon: Path, **microjoules: int) -> None:
++    for label_path in hwmon.glob("energy*_label"):
++        label = label_path.read_text().strip()
++        if label in microjoules:
++            label_path.with_name(label_path.name.replace("_label", "_input")).write_text(f"{microjoules[label]}\n")
++
++
++def test_spbm_counters_average_the_energy_spent_between_two_polls(tmp_path: Path) -> None:
++    hwmon = _make_spbm(tmp_path, pkg=1_000_000_000, cpu_e=10_000_000, cpu_p=500_000_000, gpu=7)
++    counters = SpbmCounters(tmp_path)
++
++    counters.poll(100.0)
++    assert "cpu_power_spbm_watts{" not in counters.render()
++
++    _set_spbm(hwmon, pkg=1_196_000_000, cpu_e=32_200_000, cpu_p=647_600_000)
++    counters.poll(102.0)
++
++    body = counters.render()
++    assert 'cpu_power_spbm_watts{type="cores",socket="0",source="spbm"} 84.900000' in body
++    assert 'cpu_power_spbm_watts{type="module",socket="0",source="spbm"} 98.000000' in body
++
++
++def test_spbm_counters_carry_across_the_32_bit_millijoule_wrap(tmp_path: Path) -> None:
++    wrap = 2**32 * 1000
++    hwmon = _make_spbm(tmp_path, pkg=wrap - 40_000_000, cpu_e=wrap - 1_000_000, cpu_p=wrap - 30_000_000)
++    counters = SpbmCounters(tmp_path)
++    counters.poll(10.0)
++
++    _set_spbm(hwmon, pkg=58_000_000, cpu_e=10_100_000, cpu_p=43_800_000)
++    counters.poll(11.0)
++
++    body = counters.render()
++    assert 'type="cores",socket="0",source="spbm"} 84.900000' in body
++    assert 'type="module",socket="0",source="spbm"} 98.000000' in body
++
++
++def test_spbm_counters_serve_nothing_after_an_unreadable_counter_until_two_good_polls(tmp_path: Path) -> None:
++    hwmon = _make_spbm(tmp_path, pkg=1_000_000, cpu_e=1_000_000, cpu_p=1_000_000)
++    counters = SpbmCounters(tmp_path)
++    counters.poll(1.0)
++    _set_spbm(hwmon, pkg=2_000_000, cpu_e=2_000_000, cpu_p=2_000_000)
++    counters.poll(2.0)
++    assert "cpu_power_spbm_watts{" in counters.render()
++
++    cpu_p = next(path for path in hwmon.glob("energy*_label") if path.read_text().strip() == "cpu_p")
++    cpu_p.with_name(cpu_p.name.replace("_label", "_input")).write_text("\n")
++    counters.poll(3.0)
++    assert "cpu_power_spbm_watts{" not in counters.render()
++
++    _set_spbm(hwmon, pkg=5_000_000, cpu_e=5_000_000, cpu_p=5_000_000)
++    counters.poll(4.0)
++    assert "cpu_power_spbm_watts{" not in counters.render()
++    _set_spbm(hwmon, pkg=6_000_000, cpu_e=6_000_000, cpu_p=6_000_000)
++    counters.poll(5.0)
++    assert 'type="cores",socket="0",source="spbm"} 2.000000' in counters.render()
++
++
++def test_spbm_source_is_unavailable_without_the_driver_or_one_of_its_counters(tmp_path: Path) -> None:
++    (tmp_path / "bare").mkdir()
++    with pytest.raises(SourceUnavailable, match="no spbm hwmon device"):
++        SpbmCounters(tmp_path / "bare")
++
++    _make_spbm(tmp_path, pkg=1, cpu_p=1)
++    with pytest.raises(SourceUnavailable, match="cpu_e"):
++        SpbmCounters(tmp_path)
++
++
+ def test_acpi_reader_collects_breakdowns_without_double_counting_total(tmp_path: Path) -> None:
+     domains = (
+         (0, "Total Power in uW socket 0", 150_000_000),
+diff --git a/tests/test_cpu_power_parser.py b/tests/test_cpu_power_parser.py
+index 3ef8158e..14f8cde3 100644
+--- a/tests/test_cpu_power_parser.py
++++ b/tests/test_cpu_power_parser.py
+@@ -72,6 +72,42 @@ def test_rapl_mode_reports_one_package_reading_per_socket():
+     assert scrape.total_power_w == 182.5 + 171.25
+ 
+ 
++def _spbm_body(*samples: str) -> str:
++    return "# HELP cpu_power_spbm_watts x\n# TYPE cpu_power_spbm_watts gauge\n" + "".join(
++        f"cpu_power_spbm_watts{{{sample}\n" for sample in samples
++    )
++
++
++def test_spbm_mode_reports_the_core_clusters_with_the_package_as_the_module_rail():
++    scrape = parse_cpu_scrape(
++        _spbm_body('type="cores",socket="0",source="spbm"} 84.9', 'type="module",socket="0",source="spbm"} 98.0')
++    )
++
++    assert scrape.mode == "spbm"
++    assert [(r.source, r.kind, r.sensor, r.socket_id, r.power_w) for r in scrape.readings] == [
++        ("spbm", "cores", "CPU0:coresPowerUsageW", 0, 84.9),
++        ("spbm", "module", "CPU0:modulePowerUsageW", 0, 98.0),
++    ]
++    assert [(s.socket_id, s.power_w, s.sensor, s.rails) for s in scrape.sockets] == [
++        (0, 84.9, "CPU0:coresPowerUsageW", {"module": 98.0})
++    ]
++    assert scrape.total_power_w == 84.9
++
++
++def test_spbm_mode_drops_stalled_counters_and_unknown_types():
++    scrape = parse_cpu_scrape(
++        _spbm_body(
++            'type="cores",socket="0",source="spbm"} 0',
++            'type="vcore",socket="0",source="spbm"} 4.0',
++            'type="module",socket="0",source="spbm"} 98.0',
++        )
++    )
++
++    assert [r.kind for r in scrape.readings] == ["module"]
++    assert scrape.sockets == ()
++    assert scrape.total_power_w is None
++
++
+ def test_dcgm_mode_sums_all_sockets_into_the_total():
+     scrape = parse_cpu_scrape(_dcgm_body())
+ 
+diff --git a/tests/test_cpu_rails.py b/tests/test_cpu_rails.py
+index cb0ad6c3..7ccc45fb 100644
+--- a/tests/test_cpu_rails.py
++++ b/tests/test_cpu_rails.py
+@@ -117,6 +117,7 @@ def test_every_acpi_kind_has_a_sensor_suffix():
+         cpu_rails.DCGM_KIND,
+         cpu_rails.MODULE_KIND,
+         cpu_rails.PACKAGE_KIND,
++        cpu_rails.CORES_KIND,
+     }
+ 
+ 
+diff --git a/tests/test_power_energy_report.py b/tests/test_power_energy_report.py
+index 74ceb532..69a9fd0d 100644
+--- a/tests/test_power_energy_report.py
++++ b/tests/test_power_energy_report.py
+@@ -1034,6 +1034,23 @@ def test_rapl_sourced_cpu_power_is_flagged_as_package_only(tmp_path: Path) -> No
+     assert RAPL_PACKAGE_WARNING in report.warnings
+ 
+ 
++def test_spbm_sourced_cpu_power_is_flagged_as_core_clusters_only(tmp_path: Path) -> None:
++    from srtctl.analysis.power_energy_report import SPBM_CORES_WARNING, load_cpu_samples
++
++    path = tmp_path / "cpu" / "samples.csv"
++    _write_cpu_csv(
++        path,
++        [
++            (2, 100.0, "node-a", "spbm", "CPU0:coresPowerUsageW", 0, 85.0, 85.0),
++            (2, 110.0, "node-a", "spbm", "CPU0:coresPowerUsageW", 0, 85.0, 85.0),
++        ],
++    )
++
++    report = build_concurrency_report(_window(), load_cpu_samples(path), None)
++
++    assert SPBM_CORES_WARNING in report.warnings
++
++
+ def test_acpi_sourced_cpu_power_is_not_flagged(tmp_path: Path) -> None:
+     from srtctl.analysis.power_energy_report import load_cpu_samples
+ 
+diff --git a/tests/test_schema_docs.py b/tests/test_schema_docs.py
+index bb2b29e5..81b7716c 100644
+--- a/tests/test_schema_docs.py
++++ b/tests/test_schema_docs.py
+@@ -343,7 +343,7 @@ def test_allowed_values_come_from_literals_and_validators() -> None:
+ 
+     assert values(SweepConfig, "mode") == ("zip", "grid")
+     assert values(ProfilingPhaseConfig, "capture_scope") == ("selected", "all")
+-    assert values(CpuPowerExporterConfig, "source") == ("auto", "acpi", "dcgm", "rapl")
++    assert values(CpuPowerExporterConfig, "source") == ("auto", "acpi", "dcgm", "rapl", "spbm")
+     assert values(AtomBackend, "mooncake_protocol") == ("rdma", "tcp")
+     assert values(DynamoConfig, "request_plane") == DynamoConfig._VALID_REQUEST_PLANES
+     assert values(SrtConfig, "schema") == (2,)
+diff --git a/tests/test_telemetry.py b/tests/test_telemetry.py
+index 5b155587..b56678fd 100644
+--- a/tests/test_telemetry.py
++++ b/tests/test_telemetry.py
+@@ -1981,6 +1981,34 @@ class TestCpuPowerExporterLaunch:
+         assert kwargs["command"] == [str(resolved), "--port", "9405", "--source", "acpi"]
+         collector.stop_and_finalize()
+ 
++    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
++    def test_a_source_only_the_python_exporter_serves_runs_there_despite_the_binary(self, mock_srun, tmp_path):
++        mock_srun.return_value = _running_exporter()
++        harness = _power_harness(tmp_path, [_worker("node-a", range(1))])
++        harness.config = _make_config(
++            telemetry=_dcgm_power(
++                startup_timeout_seconds=0.2,
++                request_timeout_seconds=0.1,
++                collector_join_timeout_seconds=3.0,
++                cpu_power_exporter=CpuPowerExporterConfig(port=9405, source="spbm"),
++            ),
++            benchmark=_sa_bench(),
++        )
++        resolved = tmp_path / "cpu-power-exporter"
++        resolved.write_text("#!/bin/sh\n")
++        resolved.chmod(0o755)
++        harness._resolve_bundled_binary = lambda name: str(resolved)
++        registry = ProcessRegistry(job_id="12345")
++
++        collector = harness.start_cpu_power_telemetry(registry)
++
++        assert collector is not None
++        kwargs = mock_srun.call_args.kwargs
++        assert kwargs["command"] == [
++            "python3", "-m", "srtctl.core.cpu_power_exporter", "--port", "9405", "--source", "spbm",
++        ]  # fmt: skip
++        collector.stop_and_finalize()
++
+     @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+     def test_warns_when_a_non_auto_source_cannot_be_honored_by_the_fallback(self, mock_srun, tmp_path, caplog):
+         import logging

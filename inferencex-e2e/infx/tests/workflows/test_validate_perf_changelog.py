@@ -108,6 +108,24 @@ def test_compare_entries_rejects_wrong_pr_link_on_append() -> None:
         compare_entries(base, [*base, added], 42)
 
 
+@pytest.mark.parametrize("pr_number", [42, None], ids=["pull-request", "main"])
+def test_compare_entries_accepts_a_link_to_the_local_repository(pr_number: int | None) -> None:
+    base = [entry("config-a")]
+    added = entry("config-b", "https://github.com/SemiAnalysisAI/InferenceX-local/pull/42")
+
+    additions, corrections = compare_entries(base, [*base, added], pr_number)
+
+    assert (additions, corrections) == ([added], 0)
+
+
+def test_compare_entries_rejects_another_pull_requests_local_link_on_append() -> None:
+    base = [entry("config-a")]
+    added = entry("config-b", "https://github.com/SemiAnalysisAI/InferenceX-local/pull/41")
+
+    with pytest.raises(ChangelogValidationError, match="new PR entry"):
+        compare_entries(base, [*base, added], 42)
+
+
 def test_compare_entries_requires_canonical_link_on_main() -> None:
     base = [entry("config-a")]
 

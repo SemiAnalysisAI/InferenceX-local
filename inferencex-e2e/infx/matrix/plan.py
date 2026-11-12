@@ -32,10 +32,14 @@ SCENARIO_TYPES = ("fixed-seq-len", "agentic-coding", "video-generation")
 DEFAULT_SCENARIO_TYPES = ("fixed-seq-len", "agentic-coding")
 
 
+PR_LINK_LINE = "  pr-link: "
+
+
 def get_added_lines(base_ref: str, head_ref: str, filepath: str) -> str:
     """Return the lines ``filepath`` gained between two git refs, joined by newlines.
 
-    Raise RuntimeError when git diff fails and ValueError when any non-blank line was deleted.
+    An entry's ``pr-link`` line may be corrected in place; the corrected line is not a gained one.
+    Raise RuntimeError when git diff fails and ValueError when any other non-blank line was deleted.
     """
     result = subprocess.run(
         [
@@ -51,7 +55,16 @@ def get_added_lines(base_ref: str, head_ref: str, filepath: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git diff of {filepath} failed: {result.stderr.strip()}")
 
+    def deletion(deleted_content: str) -> ValueError:
+        return ValueError(
+            f"Deletions are not allowed in {filepath}. "
+            f"Only additions to the changelog are permitted. "
+            f"Found deleted line: {deleted_content}"
+        )
+
     added_lines = []
+    # The deleted lines of the change being read, each awaiting the line that replaces it.
+    deleted: list[str] = []
     in_hunk = False
     for line in result.stdout.split("\n"):
         if line.startswith("@@"):
@@ -59,15 +72,16 @@ def get_added_lines(base_ref: str, head_ref: str, filepath: str) -> str:
         elif not in_hunk:
             continue
         elif line.startswith("-"):
-            deleted_content = line[1:]
-            if deleted_content.strip():
-                raise ValueError(
-                    f"Deletions are not allowed in {filepath}. "
-                    f"Only additions to the changelog are permitted. "
-                    f"Found deleted line: {deleted_content}"
-                )
+            if line[1:].strip():
+                deleted.append(line[1:])
+        elif line.startswith("+") and deleted:
+            replaced = deleted.pop(0)
+            if not (replaced.startswith(PR_LINK_LINE) and line[1:].startswith(PR_LINK_LINE)):
+                raise deletion(replaced)
         elif line.startswith("+"):
             added_lines.append(line[1:])
+        elif deleted:
+            raise deletion(deleted[0])
 
     return "\n".join(added_lines)
 
